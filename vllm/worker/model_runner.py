@@ -37,7 +37,8 @@ _BATCH_SIZE_ALIGNMENT = 8
 _BATCH_SIZES_TO_CAPTURE = [1, 2, 4] + [
     _BATCH_SIZE_ALIGNMENT * i for i in range(1, 33)
 ]
-
+LARGE_SEQ_GROUP_THRESHOLD = 128
+from vllm._C import ops
 
 class ModelRunner:
 
@@ -291,11 +292,32 @@ class ModelRunner:
                 subquery_lens, lora_index_mapping, lora_prompt_mapping,
                 lora_requests)
 
+    def _create_sequence_block_offsets(
+        self,
+        block_tables: torch.Tensor,  # shape: [batch_size, max_blocks_per_seq]
+        context_lens: torch.Tensor,  # shape: [batch_size]
+    ) -> torch.Tensor:
+        """Create an array of sequence block offsets."""
+        batch_size, max_blocks_per_seq = block_tables.shape
+        num_threads = batch_size * WARP_SIZE
+        sequence_block_offsets = torch.zeros(num_threads, dtype=torch.int32)
+        for i in range(batch_size):
+            block_table = block_tables[i]
+            context_len = context_lens[i]
+            num_blocks = (context_len + self.block_size - 1) // self.block_size
+            for j in range(WARP_SIZE):
+                seq_idx = i * WARP_SIZE + j
+                if seq_idx < batch_size:
+                    sequence_block_offsets[seq_idx] = block_table[0]
+                else:
+                    sequence_block_offsets[seq_idx] = num_blocks
+        return sequence_block_offsets
+
     def _prepare_decode(
         self,
         seq_group_metadata_list: List[SequenceGroupMetadata],
     ) -> Tuple[torch.Tensor, torch.Tensor, InputMetadata, List[int], List[int],
-               Set[LoRARequest]]:
+               Set[LoRARequest],int]:
         assert len(seq_group_metadata_list) > 0
         input_tokens: List[int] = []
         input_positions: List[int] = []
@@ -306,6 +328,7 @@ class ModelRunner:
         lora_prompt_mapping: List[int] = []
         lora_requests: Set[LoRARequest] = set()
 
+        divergence_block_idx = 0
         for seq_group_metadata in seq_group_metadata_list:
             assert not seq_group_metadata.is_prompt
 
@@ -341,6 +364,14 @@ class ModelRunner:
                                              self.block_size)
                     block_table = block_table[-sliding_window_blocks:]
                 block_tables.append(block_table)
+
+                # Find the divergence point.
+                for i, block_num in enumerate(block_table):
+                    if i >= divergence_block_idx:
+                        break
+                    if block_num != block_tables[0][i]:
+                        divergence_block_idx = i + 1
+                        break
 
         # vLLM uses cuda graph only for decoding requests.
         # See `capture_model` API for more details.
@@ -419,7 +450,8 @@ class ModelRunner:
             kv_cache_dtype=self.kv_cache_dtype,
         )
         return (input_tokens, input_positions, input_metadata,
-                lora_index_mapping, lora_prompt_mapping, lora_requests)
+                lora_index_mapping, lora_prompt_mapping, lora_requests,
+                divergence_block_idx)
 
     def _prepare_sample(
         self,
@@ -536,7 +568,7 @@ class ModelRunner:
             else:
                 (input_tokens, input_positions, input_metadata,
                  lora_index_mapping, lora_prompt_mapping,
-                 lora_requests) = self._prepare_decode(seq_group_metadata_list)
+                 lora_requests, divergence_block_idx) = self._prepare_decode(seq_group_metadata_list)
                 prompt_lens = []
                 subquery_lens = None
             sampling_metadata = self._prepare_sample(seq_group_metadata_list,
@@ -592,7 +624,7 @@ class ModelRunner:
     ) -> Optional[SamplerOutput]:
         (input_tokens, input_positions, input_metadata, sampling_metadata,
          lora_requests,
-         lora_mapping) = self.prepare_input_tensors(seq_group_metadata_list)
+         lora_mapping, divergence_block_idx) = self.prepare_input_tensors(seq_group_metadata_list)
 
         if self.lora_config:
             self.set_active_loras(lora_requests, lora_mapping)
@@ -603,12 +635,33 @@ class ModelRunner:
             model_executable = self.graph_runners[graph_batch_size]
         else:
             model_executable = self.model
-        hidden_states = model_executable(
-            input_ids=input_tokens,
-            positions=input_positions,
-            kv_caches=kv_caches,
-            input_metadata=input_metadata,
+
+        # Determine if we should use the hybrid kernel.
+        use_hybrid_kernel = (
+            input_metadata.num_generation_tokens > LARGE_SEQ_GROUP_THRESHOLD
+            and divergence_block_idx > 0
         )
+
+        if use_hybrid_kernel:
+            # Create sequence block offsets.
+            sequence_block_offsets = self._create_sequence_block_offsets(
+                input_metadata.block_tables, input_metadata.context_lens
+            )
+
+            # Launch the hybrid kernel.
+            ops.hybrid_paged_attention(
+                # ... existing arguments ...
+                divergence_block_idx,
+                sequence_block_offsets,
+            )
+        else:
+            # Use the original kernel.
+            hidden_states = model_executable(
+                input_ids=input_tokens,
+                positions=input_positions,
+                kv_caches=kv_caches,
+                input_metadata=input_metadata,
+            )
 
         # Compute the logits.
         logits = self.model.compute_logits(hidden_states, sampling_metadata)
